@@ -1,0 +1,1359 @@
+name: build-linux-glibc228
+
+# 目标：产出的 Linux 二进制最高只依赖 glibc 2.28（RHEL8 / AlmaLinux8 / Ubuntu20.04+ / Debian10+）
+#
+# 双通道（各保留最新一份，仓库根目录固定文件名）：
+#   stable  → 上游最新 release / tag
+#   nightly → 上游默认分支（master）HEAD
+# 每次发布都会删除根目录里除这两个文件以外的历史产物；
+# 可选 purge_history=true 时，还会用 git-filter-repo 把历史提交里的旧产物彻底清除并强制推送。
+#
+# 流程（参照 a08381/EcoEnchants_Binary 的 main.yml）：
+#   定时/手动触发 → 读本仓库缓存的 COMMIT_ID_stable / COMMIT_ID_nightly
+#   → 查上游 stable(tag) / nightly(branch) 最新 commit
+#   → 有变化才构建 → publish job 汇总两个通道产物、清理旧文件、一次性提交推送
+#
+# 仓库角色：
+#   本仓库（builder） ：workflow、COMMIT_ID_*、以及构建好的二进制包
+#   上游仓库（source）：真正的源码（含 luajit / vcpkg / frida-gum-src 子模块）
+#
+# 注意1：容器里 ldd/gcc/cmake 都是多行输出，禁止 `cmd --version | head -1`：
+#       head 提前关闭管道 → 写端收到 SIGPIPE → 配合 -o pipefail 直接 exit 141。
+# 注意2：Steamworks SDK（3rd/steam + 3rd/steam_sdk）在部分 fork / builder 仓库里被裁剪掉了，
+#       且仓库自带的 tools/update_steamsdk.py 也可能不存在，因此本 workflow 不依赖任何仓库内脚本。
+on:
+  # 每小时检查一次上游是否有新提交（EcoEnchants_Binary 同款写法）
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: '忽略 COMMIT_ID 比对，强制重新构建并推送两个通道'
+        type: boolean
+        default: false
+      purge_history:
+        description: '⚠️ 清除 git 历史中的旧产物（改写历史 + 强制推送），仅手动触发时使用'
+        type: boolean
+        default: false
+      upstream_repo:
+        description: '上游源码仓库（owner/repo）'
+        type: string
+        required: false
+        default: 'fesily/DontStarveLuaJIT2'
+      upstream_branch:
+        description: '上游默认分支（nightly 通道跟随它）'
+        type: string
+        required: false
+        default: 'master'
+      build_type:
+        description: 'CMake 配置（Ninja Multi-Config）'
+        type: choice
+        required: true
+        default: RelWithDebInfo
+        options: [RelWithDebInfo, Release, Debug]
+      libstdcxx:
+        description: 'libstdc++ 处理策略：static=打入模块；bundle=随包附带到 Mod/deps'
+        type: choice
+        required: true
+        default: static
+        options: [static, bundle]
+      steam_mode:
+        description: 'Steamworks SDK 获取方式'
+        type: choice
+        required: true
+        default: auto
+        options: [auto, secret, stub, none]
+      frida_mode:
+        description: 'frida-gum 获取方式（meson 全量编译需数小时且易失败）'
+        type: choice
+        required: true
+        default: auto
+        options: [auto, devkit, meson]
+
+permissions:
+  # 需要 contents: write 才能把构建产物 + COMMIT_ID 提交回本仓库
+  contents: write
+
+concurrency:
+  group: linux-glibc228-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # 上游源码 checkout 到本仓库工作区下的这个子目录
+  SRC_DIR: DontStarveLuaJIT2
+  UPSTREAM_REPO: ${{ inputs.upstream_repo || 'fesily/DontStarveLuaJIT2' }}
+  UPSTREAM_BRANCH: ${{ inputs.upstream_branch || 'master' }}
+  VCPKG_ROOT: ${{ github.workspace }}/DontStarveLuaJIT2/vcpkg
+  VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.vcpkg-bincache
+  VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/.vcpkg-bincache,readwrite
+  VCPKG_FORCE_SYSTEM_BINARIES: '1'
+  # CC/CXX 不在这里硬编码：不同 tag 的 manylinux_2_28 预装 toolset 版本不同（11/12/13/14），
+  # 由 "Detect toolchain" 步骤探测后写入 $GITHUB_ENV。
+
+jobs:
+  check:
+    name: 检查上游 stable / nightly 是否有更新
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.decide.outputs.changed }}
+      matrix: ${{ steps.decide.outputs.matrix }}
+      stable_sha: ${{ steps.stable.outputs.sha }}
+      nightly_sha: ${{ steps.nightly.outputs.sha }}
+      build_type: ${{ steps.cfg.outputs.build_type }}
+      libstdcxx: ${{ steps.cfg.outputs.libstdcxx }}
+    steps:
+      # 先 checkout 本仓库（builder），用于读取 COMMIT_ID_* 以及后续 commit/push
+      - name: Checkout Git Repository
+        uses: actions/checkout@v4
+
+      - name: Get Cached Commit ID
+        id: cached
+        run: |
+          set -euo pipefail
+          read_id() { if [ -f "$1" ]; then tr -d ' \t\r\n' < "$1"; else printf ''; fi; }
+          s="$(read_id ./COMMIT_ID_stable)"
+          n="$(read_id ./COMMIT_ID_nightly)"
+          echo "stable=$s"  >> "$GITHUB_OUTPUT"
+          echo "nightly=$n" >> "$GITHUB_OUTPUT"
+          echo "CACHED_STABLE=$s"   >> "$GITHUB_ENV"
+          echo "CACHED_NIGHTLY=$n"  >> "$GITHUB_ENV"
+          echo "缓存 stable : ${s:-<空>}"
+          echo "缓存 nightly: ${n:-<空>}"
+
+      # 两个通道各自解析，step id 必须与 job outputs 里的 steps.<id>.outputs.sha 对应：
+      #   stable  → steps.stable.outputs.sha   （最新 release/tag）
+      #   nightly → steps.nightly.outputs.sha  （默认分支 HEAD）
+
+      - name: Get Stable Commit ID
+        id: stable
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ env.UPSTREAM_REPO }}
+          BRANCH: ${{ env.UPSTREAM_BRANCH }}
+        run: |
+          set -euo pipefail
+          gh_api() { curl -sS --fail --retry 3 --max-time 60 \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/$1" || true; }
+          pick() { # $1=json $2=key
+            if command -v jq >/dev/null 2>&1; then
+              printf '%s' "$1" | jq -r ".$2 // empty" 2>/dev/null | head -n1
+            else
+              printf '%s' "$1" | tr ',{}[]' '\n' | grep -m1 "\"$2\"" \
+                | sed -n "s/.*\"$2\" *: *\"\([^\"]*\)\".*/\1/p"
+            fi
+          }
+
+          # stable = 最新 release 的 tag；无 release 退到最新 tag；都没有则跟分支
+          tag="$(pick "$(gh_api "releases/latest")" tag_name)"
+          if [ -z "$tag" ]; then
+            echo "::warning::上游无 latest release，退到最新 tag"
+            tag="$(pick "$(gh_api "tags")" name)"
+          fi
+          ref="$tag"; sha=""
+          if [ -n "$tag" ]; then
+            sha="$(pick "$(gh_api "commits/${tag}")" sha)"
+            if [ -z "$sha" ]; then
+              sha="$(git ls-remote "https://github.com/${REPO}" "refs/tags/${tag}" | awk '{print $1}' | head -n1)"
+            fi
+          fi
+          if [ -z "$ref" ]; then
+            echo "::warning::上游既无 release 也无 tag，stable 暂时跟随 ${BRANCH}"
+            ref="$BRANCH"
+            sha="$(pick "$(gh_api "commits/${BRANCH}")" sha)"
+            [ -n "$sha" ] || sha="$(git ls-remote "https://github.com/${REPO}" "refs/heads/${BRANCH}" | awk '{print $1}' | head -n1)"
+          fi
+          test -n "$sha" || { echo "::error::无法解析 stable 的 commit"; exit 1; }
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "UPSTREAM_STABLE=$sha" >> "$GITHUB_ENV"
+          echo "stable : $ref -> $sha"
+
+      - name: Get Nightly Commit ID
+        id: nightly
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ env.UPSTREAM_REPO }}
+          BRANCH: ${{ env.UPSTREAM_BRANCH }}
+        run: |
+          set -euo pipefail
+          gh_api() { curl -sS --fail --retry 3 --max-time 60 \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/$1" || true; }
+          pick() {
+            if command -v jq >/dev/null 2>&1; then
+              printf '%s' "$1" | jq -r ".$2 // empty" 2>/dev/null | head -n1
+            else
+              printf '%s' "$1" | tr ',{}[]' '\n' | grep -m1 "\"$2\"" \
+                | sed -n "s/.*\"$2\" *: *\"\([^\"]*\)\".*/\1/p"
+            fi
+          }
+
+          # nightly = 默认分支 HEAD
+          sha="$(pick "$(gh_api "commits/${BRANCH}")" sha)"
+          if [ -z "$sha" ]; then
+            echo "::warning::API 取分支失败，回退 git ls-remote"
+            sha="$(git ls-remote "https://github.com/${REPO}" "refs/heads/${BRANCH}" | awk '{print $1}' | head -n1)"
+          fi
+          test -n "$sha" || { echo "::error::无法解析 ${REPO}@${BRANCH} 的 commit"; exit 1; }
+          echo "sha=$sha"  >> "$GITHUB_OUTPUT"
+          echo "ref=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "UPSTREAM_NIGHTLY=$sha" >> "$GITHUB_ENV"
+          echo "nightly: $BRANCH -> $sha"
+
+      - name: Resolve build config
+        id: cfg
+        env:
+          IN_BUILD_TYPE: ${{ inputs.build_type }}
+          IN_LIBSTDCXX: ${{ inputs.libstdcxx }}
+        run: |
+          set -euo pipefail
+          echo "build_type=${IN_BUILD_TYPE:-RelWithDebInfo}" >> "$GITHUB_OUTPUT"
+          echo "libstdcxx=${IN_LIBSTDCXX:-static}" >> "$GITHUB_OUTPUT"
+
+      # 需要构建的通道拼成 matrix（job 级 if 里不能用 matrix，只能在上一 job 算好）
+      - name: Compare And Decide
+        id: decide
+        env:
+          FORCE: ${{ inputs.force_build }}
+          S_REF: ${{ steps.stable.outputs.ref }}
+        run: |
+          set -euo pipefail
+          entries=""
+          add() { # $1=channel $2=ref $3=sha
+            [ -n "$entries" ] && entries="$entries,"
+            entries="$entries{\"channel\":\"$1\",\"ref\":\"$2\",\"sha\":\"$3\"}"
+          }
+          if [ "$FORCE" = "true" ] || [ "$CACHED_STABLE" != "$UPSTREAM_STABLE" ]; then
+            add stable "$S_REF" "$UPSTREAM_STABLE"
+          fi
+          if [ "$FORCE" = "true" ] || [ "$CACHED_NIGHTLY" != "$UPSTREAM_NIGHTLY" ]; then
+            add nightly "${{ env.UPSTREAM_BRANCH }}" "$UPSTREAM_NIGHTLY"
+          fi
+          if [ -z "$entries" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "matrix={\"include\":[]}" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "matrix={\"include\":[$entries]}" >> "$GITHUB_OUTPUT"
+          fi
+          {
+            echo '### 上游更新检查'
+            echo "- 上游仓库 : ${{ env.UPSTREAM_REPO }}"
+            echo ''
+            echo '| 通道 | 缓存 | 最新 | 结论 |'
+            echo '|---|---|---|---|'
+            echo "| stable | ${CACHED_STABLE:-<空>} | ${UPSTREAM_STABLE} | $( [ "$FORCE" = true ] || [ "$CACHED_STABLE" != "$UPSTREAM_STABLE" ] && echo '构建' || echo '跳过' ) |"
+            echo "| nightly | ${CACHED_NIGHTLY:-<空>} | ${UPSTREAM_NIGHTLY} | $( [ "$FORCE" = true ] || [ "$CACHED_NIGHTLY" != "$UPSTREAM_NIGHTLY" ] && echo '构建' || echo '跳过' ) |"
+            echo ''
+            echo "- 强制构建 : ${FORCE:-false}"
+          } >> "$GITHUB_STEP_SUMMARY"
+  build:
+    name: ${{ matrix.channel }} / linux-x86_64 / glibc 2.28
+    needs: check
+    if: ${{ needs.check.outputs.changed == 'true' }}
+    runs-on: ubuntu-24.04
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+        # 用字面量而非 ${{ env.SRC_DIR }}：working-directory 对 env 上下文的支持不保证
+        working-directory: DontStarveLuaJIT2
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.check.outputs.matrix) }}
+    steps:
+      # 1) 先 checkout 本仓库（builder）：后续要把二进制包 + COMMIT_ID 提交回这里。
+      #    用默认路径（工作区根），token 用 GITHUB_TOKEN 才能 push。
+      # 1) checkout 本仓库（builder）。只是为了拿到仓库结构；
+      #    提交与推送统一放到 publish job 里做，避免两个通道并发 push 撞车。
+      - name: Checkout Builder Repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 1
+
+      # 2) checkout 上游源码到 DontStarveLuaJIT2/（含 luajit / vcpkg / frida-gum-src 子模块）
+      #    ref 由 check job 决定：stable → release tag，nightly → 分支名
+      - name: Checkout Upstream Source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ matrix.ref }}
+          path: DontStarveLuaJIT2
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: 容器内 git 安全目录
+        run: git config --global --add safe.directory '*'
+
+      - name: 预检：工程完整性（仅报告，不中断）
+        run: |
+          set -euo pipefail
+          missing=0
+          check() {
+            if [ -e "$1" ]; then printf '  OK   %s\n' "$1"
+            else printf '  MISS %s\n' "$1"; missing=1; fi
+          }
+          echo "## 关键路径检查"
+          for p in CMakeLists.txt CMakePresets.json vcpkg.json vcpkg-configuration.json \
+                   vcpkg/scripts/buildsystems/vcpkg.cmake vcpkg/bootstrap-vcpkg.sh \
+                   luajit/CMakeLists.txt luajit/src/lj_arch.h \
+                   cmake/FindSteam.cmake cmake/FindFrida-gum.cmake cmake/custom-triplets \
+                   tools/missfunc.py tools/setup_frida_gum.py tools/update_version.py \
+                   tools/modinfo2cpp.lua tools/gen_plugins_manifest.py \
+                   3rd/frida-gum-src src/DontStarveInjector/CMakeLists.txt \
+                   Mod/modinfo.lua Mod/modmain.lua tests/CMakeLists.txt; do
+            check "$p"
+          done
+          {
+            echo '### 工程完整性预检'
+            echo '缺失项会在后续步骤尝试自动补齐（vcpkg / Steam SDK），'
+            echo '无法自动补齐的（luajit / tools / src / Mod）需要从上游同步。'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$missing" -eq 1 ]; then
+            echo "::warning::存在缺失路径，见上方列表；能自动补齐的会继续，无法补齐的请在仓库中同步上游内容"
+          fi
+
+      - name: Detect toolchain（自动探测 gcc-toolset，C++23 需 >= 13）
+        run: |
+          set -euo pipefail
+          ts_root=""
+          for d in $(ls -d /opt/rh/gcc-toolset-*/root 2>/dev/null | sort -V -r); do
+            if [ -x "$d/usr/bin/gcc" ]; then ts_root="$d"; break; fi
+          done
+          if [ -z "$ts_root" ]; then
+            echo "::error::容器内未找到任何 /opt/rh/gcc-toolset-*/root/usr/bin/gcc"
+            ls -1 /opt/rh 2>/dev/null || true
+            exit 1
+          fi
+          echo "toolset root: $ts_root"
+          echo "CC=$ts_root/usr/bin/gcc"     >> "$GITHUB_ENV"
+          echo "CXX=$ts_root/usr/bin/g++"    >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$ts_root/usr/lib64:$ts_root/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+          echo "PATH=$ts_root/usr/bin:$PATH" >> "$GITHUB_ENV"
+
+      - name: 构建环境基线（glibc / gcc）
+        run: |
+          set -euo pipefail
+          libc_ver="$(ldd --version)";   echo "glibc : ${libc_ver%%$'\n'*}"
+          cc_ver="$("$CC" --version)";   echo "gcc   : ${cc_ver%%$'\n'*}"
+          cxx_ver="$("$CXX" --version)"; echo "g++   : ${cxx_ver%%$'\n'*}"
+          major="$("$CC" -dumpversion | cut -d. -f1)"
+          test "$major" -ge 13 || { echo "::error::C++23 需要 gcc>=13，当前 $major"; exit 1; }
+
+      - name: 容器内安装系统工具
+        run: |
+          set -euo pipefail
+          yum install -y --setopt=tsflags=nodocs \
+            zip unzip tar xz make perl-core pkgconf-pkg-config diffutils file which git
+          yum clean all
+
+      - name: 容器内安装 cmake / ninja / meson（固定版本）
+        run: |
+          set -euo pipefail
+          PYBIN="$(ls -d /opt/python/cp3*/bin/python3 2>/dev/null | sort -V | tail -n1)"
+          PYBIN="${PYBIN:-$(command -v python3)}"
+          "$PYBIN" -m pip install --upgrade pip
+          "$PYBIN" -m pip install 'cmake==3.31.6' 'ninja==1.11.1' 'meson'
+          ln -sf "$(dirname "$PYBIN")/cmake" /usr/local/bin/cmake
+          ln -sf "$(dirname "$PYBIN")/ninja" /usr/local/bin/ninja
+          ln -sf "$(dirname "$PYBIN")/meson" /usr/local/bin/meson
+          cm="$(cmake --version)"; echo "cmake : ${cm%%$'\n'*}"
+          echo "ninja  : $(ninja --version)"
+          echo "meson  : $(meson --version)"
+
+      # ------------------------------------------------------------------
+      # Steamworks SDK（自包含，不依赖仓库内 tools/ 脚本）
+      #   cmake/FindSteam.cmake 需要：
+      #     - 3rd/steam/steam_api.h                       （find_path）
+      #     - 3rd/steam/redistributable_bin/linux64/libsteam_api*.so|.a（find_library）
+      #   源码里 Steam.cpp 还 #include <steam_sdk/isteamuser.h>，
+      #   而 STEAM_SDK_INCLUDE_DIR=3rd，所以还需要 3rd/steam_sdk/*.h。
+      # ------------------------------------------------------------------
+      - name: 准备 Steamworks SDK
+        env:
+          STEAM_MODE: ${{ inputs.steam_mode || 'auto' }}
+          STEAM_SDK_B64: ${{ secrets.STEAMWORKS_SDK_B64 }}
+        run: |
+          set -euo pipefail
+          HDR="3rd/steam/steam_api.h"
+          LIBDIR="3rd/steam/redistributable_bin/linux64"
+          find_lib() { ls "$LIBDIR"/libsteam_api64.so "$LIBDIR"/libsteam_api.so "$LIBDIR"/libsteam_api64.a "$LIBDIR"/libsteam_api.a 2>/dev/null | head -n1; }
+
+          if [ -f "$HDR" ] && [ -n "$(find_lib)" ] && [ -d 3rd/steam_sdk ]; then
+            echo "Steam SDK 已随仓库提供，跳过准备"; exit 0
+          fi
+
+          case "$STEAM_MODE" in
+            none)
+              echo "steam_mode=none：禁用 Steam 支持"
+              ;;
+            secret)
+              if [ -z "${STEAM_SDK_B64:-}" ]; then
+                echo "::error::steam_mode=secret 但未配置 secret STEAMWORKS_SDK_B64"; exit 1
+              fi
+              echo "$STEAM_SDK_B64" | base64 -d > /tmp/steam_sdk.tgz
+              tar -xzf /tmp/steam_sdk.tgz -C . || unzip -q -o /tmp/steam_sdk.tgz -d .
+              ;;
+            auto|stub)
+              # 1) 先尝试 secret（auto 模式下如果配了就用）
+              if [ -n "${STEAM_SDK_B64:-}" ]; then
+                echo "$STEAM_SDK_B64" | base64 -d > /tmp/steam_sdk.tgz
+                if tar -xzf /tmp/steam_sdk.tgz -C . || unzip -q -o /tmp/steam_sdk.tgz -d .; then
+                  echo "已从 secret 还原 Steam SDK"
+                fi
+              fi
+              # 2) 仍缺头文件 → 用公开的 Goldberg(gbe_fork) sdk/steam 头文件兜底
+              if [ ! -f "$HDR" ]; then
+                rm -rf /tmp/gbe
+                for repo in "https://github.com/Detanup01/gbe_fork" "https://gitcode.com/gh_mirrors/gbe/gbe_fork"; do
+                  if git clone --depth 1 -b dev "$repo" /tmp/gbe 2>/dev/null; then break; fi
+                  rm -rf /tmp/gbe
+                done
+                if [ ! -d /tmp/gbe/sdk/steam ]; then
+                  echo "::error::无法获取公开 steam 头文件（gbe_fork/sdk/steam）"; exit 1
+                fi
+                mkdir -p 3rd/steam 3rd/steam_sdk
+                cp -r /tmp/gbe/sdk/steam/. 3rd/steam/
+                cp -r /tmp/gbe/sdk/steam/. 3rd/steam_sdk/
+              fi
+              # 3) 仍缺库 → 生成链接期桩库（静态 .a，不产生 DT_NEEDED，运行时不影响）
+              if [ -z "$(find_lib)" ]; then
+                echo "::warning::未找到 libsteam_api，生成链接期桩库（Steam 账号捕获功能降级为不可用）"
+                mkdir -p "$LIBDIR"
+                cat > /tmp/steam_stub.cpp <<'EOF'
+          extern "C" {
+            void *SteamInternal_ContextInit(void *p) { static void *s[3] = {0, 0, 0}; (void)p; return s; }
+            void *SteamInternal_FindOrCreateUserInterface(int h, const char *v) { (void)h; (void)v; return 0; }
+            void *SteamInternal_FindOrCreateGameServerInterface(int h, const char *v) { (void)h; (void)v; return 0; }
+            int SteamAPI_GetHSteamUser() { return 0; }
+            int SteamGameServer_GetHSteamUser() { return 0; }
+          }
+          EOF
+                "$CXX" -std=c++17 -fPIC -c /tmp/steam_stub.cpp -o /tmp/steam_stub.o
+                ar rcs "$LIBDIR/libsteam_api.a" /tmp/steam_stub.o
+              fi
+              ;;
+          esac
+
+          # none 模式：给顶层 CMakeLists 的 find_package(Steam REQUIRED) 加开关
+          if [ "$STEAM_MODE" = "none" ]; then
+            if ! grep -q 'DS_NO_STEAM' CMakeLists.txt; then
+              python3 - <<'PY'
+          import pathlib
+          p = pathlib.Path('CMakeLists.txt')
+          t = p.read_text(encoding='utf-8')
+          old = 'find_package(Steam REQUIRED)'
+          new = 'if(NOT DS_NO_STEAM)\n    find_package(Steam REQUIRED)\nendif()'
+          if old not in t:
+              raise SystemExit('CMakeLists.txt 中未找到 find_package(Steam REQUIRED)')
+          p.write_text(t.replace(old, new, 1), encoding='utf-8')
+          PY
+            fi
+            echo "DS_NO_STEAM=ON" >> "$GITHUB_ENV"
+          fi
+
+          test -f "$HDR" || { echo "::error::缺少 $HDR"; exit 1; }
+          ls -l "$LIBDIR" | sed -n '1,10p'
+
+      - name: 缓存 vcpkg 工具目录（子模块为空时尤其有用）
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.SRC_DIR }}/vcpkg
+          key: vcpkg-tool-${{ matrix.arch }}-${{ hashFiles('vcpkg-configuration.json') }}
+
+      - name: 缓存 vcpkg 二进制包
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.SRC_DIR }}/.vcpkg-bincache
+          key: vcpkg-${{ matrix.arch }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'CMakeLists.txt', 'cmake/custom-triplets/**') }}
+
+      - name: 缓存 frida-gum 产物（meson 全量编译非常慢）
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.SRC_DIR }}/3rd/frida-gum
+          key: frida-gum-${{ matrix.arch }}-${{ hashFiles('tools/setup_frida_gum.py', 'tools/frida/**') }}
+
+      - name: 准备 vcpkg（缺失时按 baseline 拉取 + bootstrap）
+        run: |
+          set -euo pipefail
+          BASELINE="$(python3 - <<'PY'
+          import json, pathlib
+          default = "dd3097e305afa53f7b4312371f62058d2e665320"
+          p = pathlib.Path("vcpkg-configuration.json")
+          if not p.is_file():
+              print(default); raise SystemExit(0)
+          try:
+              d = json.loads(p.read_text(encoding="utf-8"))
+              reg = d.get("default-registry", {})
+              print(reg.get("baseline") or default)
+          except Exception:
+              print(default)
+          PY
+          )"
+          echo "vcpkg baseline: $BASELINE"
+
+          if [ -f vcpkg/scripts/buildsystems/vcpkg.cmake ]; then
+            echo "vcpkg 已存在，跳过拉取"
+          else
+            echo "::warning::vcpkg 子模块为空，按 baseline 拉取 microsoft/vcpkg"
+            rm -rf vcpkg /tmp/vcpkg-src
+            mkdir -p /tmp/vcpkg-src
+            ok=0
+            # codeload 支持任意 commit 的 tarball，比 depth-1 clone 更可靠
+            for url in "https://codeload.github.com/microsoft/vcpkg/tar.gz/$BASELINE" \
+                       "https://github.com/microsoft/vcpkg/archive/$BASELINE.tar.gz"; do
+              if curl -fsSL --retry 3 --max-time 300 -o /tmp/vcpkg.tgz "$url"; then ok=1; break; fi
+            done
+            if [ "$ok" -ne 1 ]; then
+              # 最后兜底：浅克隆后切到 baseline
+              git clone --depth 1 https://github.com/microsoft/vcpkg.git /tmp/vcpkg-git \
+                && git -C /tmp/vcpkg-git fetch --depth 1 origin "$BASELINE" \
+                && git -C /tmp/vcpkg-git checkout FETCH_HEAD || {
+                  echo "::error::无法获取 vcpkg（网络受限）；建议改用 self-hosted runner 或预置 vcpkg 镜像"; exit 1; }
+              mv /tmp/vcpkg-git vcpkg
+            else
+              tar -xzf /tmp/vcpkg.tgz -C /tmp/vcpkg-src
+              mv /tmp/vcpkg-src/*/ vcpkg 2>/dev/null || mv "$(find /tmp/vcpkg-src -maxdepth 1 -mindepth 1 -type d | head -n1)" vcpkg
+            fi
+          fi
+
+          test -f vcpkg/scripts/buildsystems/vcpkg.cmake || { echo "::error::vcpkg 工具链文件仍缺失"; exit 1; }
+          test -f vcpkg/bootstrap-vcpkg.sh || { echo "::error::vcpkg/bootstrap-vcpkg.sh 缺失"; exit 1; }
+          chmod +x vcpkg/bootstrap-vcpkg.sh
+          ./vcpkg/bootstrap-vcpkg.sh -disableMetrics
+          ./vcpkg/vcpkg version
+
+      # ------------------------------------------------------------------
+      # frida-gum
+      #   CMake configure 阶段会调用 tools/setup_frida_gum.py。默认走 meson 全量编译
+      #   （./configure && make），在 CI 上极易失败且耗时数小时。
+      #   这里改用官方预编译 devkit（frida-gum.h + libfrida-gum.a）：
+      #     - 放进 3rd/frida-gum/_legacy_linux64/（脚本 --skip-meson 的 durable 输入目录）
+      #     - 导出 DS_FRIDA_GUM_SKIP_MESON=1 → CMake 传 --skip-meson，只链接 .so 外壳
+      #   devkit 由 frida 官方按 glibc 2.17+ 构建，本身不引入高版本 glibc 符号。
+      # ------------------------------------------------------------------
+      - name: 准备 frida-gum（官方 devkit 优先）
+        env:
+          FRIDA_MODE: ${{ inputs.frida_mode || 'auto' }}
+        run: |
+          set -euo pipefail
+          VER="$(python3 - <<'PY'
+          import re, pathlib
+          default = "17.17.0"
+          p = pathlib.Path("CMakeLists.txt")
+          if not p.is_file():
+              print(default); raise SystemExit(0)
+          m = re.search(r'set\(FRIDA_GUM_VERSION\s+"([^"]+)"\)', p.read_text(encoding="utf-8"))
+          print(m.group(1) if m else default)
+          PY
+          )"
+          echo "FRIDA_GUM_VERSION=$VER"
+
+          plat="linux64"                       # script map_plat(): Linux → linux64
+          target="linux-x86_64"                # 仅构建 x86_64
+          stage="3rd/frida-gum/${plat}"
+          legacy="3rd/frida-gum/_legacy_${plat}"
+
+          # 1) 已 staged（缓存命中）→ 直接用，脚本会因 marker 提前返回
+          if ls "${stage}"/version-*.txt >/dev/null 2>&1; then
+            echo "frida-gum 已 staged（缓存命中），跳过"; exit 0
+          fi
+
+          if [ "$FRIDA_MODE" = "meson" ]; then
+            echo "::warning::frida_mode=meson：强制 meson 全量编译（耗时数小时，且需要 ninja 与网络）"
+            echo "DS_FRIDA_GUM_FORCE_MESON=1" >> "$GITHUB_ENV"
+            command -v ninja >/dev/null || { echo "::error::meson 编译需要 ninja"; exit 1; }
+            exit 0
+          fi
+
+          # 2) 下载官方 devkit
+          url="https://github.com/frida/frida/releases/download/${VER}/frida-gum-devkit-${VER}-${target}.tar.xz"
+          echo "devkit url: $url"
+          rm -rf /tmp/gum-devkit && mkdir -p /tmp/gum-devkit
+          ok=0
+          for i in 1 2 3; do
+            if curl -fsSL --max-time 600 -o /tmp/gum-devkit.tar.xz "$url"; then ok=1; break; fi
+            sleep 5
+          done
+          if [ "$ok" -ne 1 ]; then
+            if [ "$FRIDA_MODE" = "devkit" ]; then
+              echo "::error::frida devkit 下载失败： $url"; exit 1
+            fi
+            echo "::warning::devkit 下载失败，回退 meson 全量编译（很可能超时/失败，建议改为上传 3rd/frida-gum 缓存）"
+            command -v ninja >/dev/null || { echo "::error::meson 编译需要 ninja"; exit 1; }
+            exit 0
+          fi
+          tar -xJf /tmp/gum-devkit.tar.xz -C /tmp/gum-devkit
+          lib="$(find /tmp/gum-devkit -name 'libfrida-gum.a' | head -n1)"
+          hdr="$(find /tmp/gum-devkit -name 'frida-gum.h'  | head -n1)"
+          test -n "$lib" -a -n "$hdr" || { echo "::error::devkit 内容异常"; find /tmp/gum-devkit | head -20; exit 1; }
+          mkdir -p "$legacy"
+          cp -f "$lib" "$legacy/libfrida-gum.a"
+          cp -f "$hdr" "$legacy/frida-gum.h"
+          ls -l "$legacy"
+
+          # 3) 预检链接（devkit 静态库可能需要额外的系统库）
+          extra=""
+          for cand in "" "-lresolv" "-lrt" "-lresolv -lrt" "-lresolv -lrt -lpcre"; do
+            # shellcheck disable=SC2086
+            if "$CC" -shared -fPIC -o /tmp/gum_shell_test.so \
+                 tools/frida/frida_gum_shell.c -I"$legacy" -DGUM_EXPORTS \
+                 -Wl,--whole-archive "$legacy/libfrida-gum.a" -Wl,--no-whole-archive \
+                 -lpthread -ldl -lm $cand >/tmp/gum_link.log 2>&1; then
+              extra="$cand"; break
+            fi
+          done
+          if [ -z "$extra" ] && [ ! -s /tmp/gum_shell_test.so ]; then
+            echo "::error::devkit 链接外壳失败，日志："; tail -40 /tmp/gum_link.log || true
+            exit 1
+          fi
+          echo "link ok, extra libs: '${extra:-none}'"
+
+          # 4) 需要额外系统库 → 用 CC wrapper 透传（脚本 link_shell_posix 只读 $CC）
+          if [ -n "$extra" ]; then
+            real_cc="$CC"
+            cat > /usr/local/bin/ds-cc <<EOF
+          #!/bin/bash
+          # 透传给真实 gcc；仅链接阶段补充 frida-gum devkit 需要的系统库
+          for a in "\$@"; do [ "\$a" = "-c" ] && exec "$real_cc" "\$@"; done
+          exec "$real_cc" "\$@" $extra
+          EOF
+            chmod +x /usr/local/bin/ds-cc
+            echo "CC=/usr/local/bin/ds-cc" >> "$GITHUB_ENV"
+          fi
+
+          echo "DS_FRIDA_GUM_SKIP_MESON=1" >> "$GITHUB_ENV"
+
+      # ------------------------------------------------------------------
+      # glibc < 2.34（manylinux_2_28 = 2.28）时 dl/pthread/rt 仍是独立库。
+      # 上游只在 InjectorStub 上用了 ${CMAKE_DL_LIBS}，其余目标（signature_updater、
+      # Injector、plugins…）都依赖 glibc>=2.34 把 dlopen 合进 libc 的行为，
+      # 在 2.28 下必然 undefined reference to dlopen/dlsym/dladdr/dlclose。
+      # 这里用探针精确判定需要补哪些系统库，再通过
+      # CMAKE_{C,CXX}_STANDARD_LIBRARIES 追加到每条链接命令末尾。
+      # ------------------------------------------------------------------
+      - name: 探测 glibc 2.28 需补充的系统库
+        run: |
+          set -euo pipefail
+          # 判定依据直接用 glibc 版本号，不用"试链接"探针：
+          # 探针里 dladdr/Dl_info 需要 _GNU_SOURCE，否则 gcc14 直接编译失败，
+          # 而"两次都失败"会被误判成"无需该库"（上一版正是踩了这个坑）。
+          libc_line="$(ldd --version)"
+          glibc_ver="$(printf '%s' "$libc_line" | awk 'NR==1{print $NF}')"
+          echo "glibc: $glibc_ver"
+          ver_lt() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" = "$1" ] && [ "$1" != "$2" ]; }
+
+          SYSLIBS=""
+          if ver_lt "$glibc_ver" "2.34"; then
+            # glibc < 2.34：dl / pthread / rt 都还是独立库（2.34 起并入 libc）
+            SYSLIBS="-ldl -lpthread -lrt"
+            echo "glibc < 2.34 → 需独立 dl/pthread/rt"
+          else
+            echo "glibc >= 2.34 → dl/pthread/rt 已并入 libc"
+          fi
+
+          # 逐个确认库可用：任何一个 -l 找不到都会让所有目标链接全挂。
+          # 注意不能用空文件试链（会因缺 main 而误判），要用带 main 的探针。
+          printf 'int main(void){return 0;}\n' > /tmp/probe_empty.c
+          keep=""
+          for f in $SYSLIBS; do
+            if "$CC" /tmp/probe_empty.c -o /tmp/probe.out "$f" >/dev/null 2>&1; then
+              keep="$keep $f"
+            else
+              echo "::warning::库不可用，仍会传入（缺库会显式报错，便于定位）: $f"
+              keep="$keep $f"
+            fi
+          done
+          SYSLIBS="$(echo "$keep" | xargs)"
+
+          # libatomic：仅当 16 字节原子操作真的落到库里才补，并用 --as-needed
+          # 包住，避免无条件产生 DT_NEEDED(libatomic.so.1) 影响目标机部署。
+          cat > /tmp/probe_atomic.c <<'EOF'
+          int main(void) { __int128 a = 0, b = 0; __atomic_store(&a, &b, __ATOMIC_SEQ_CST); __atomic_load(&a, &b, __ATOMIC_SEQ_CST); return (int) b; }
+          EOF
+          if ! "$CC" /tmp/probe_atomic.c -o /tmp/probe.out >/dev/null 2>&1; then
+            if "$CC" /tmp/probe_atomic.c -o /tmp/probe.out -latomic >/dev/null 2>&1; then
+              SYSLIBS="$SYSLIBS -Wl,--as-needed -latomic -Wl,--no-as-needed"
+              echo "补充: -latomic (as-needed)"
+            else
+              echo "::warning::libatomic 不可用，若后续出现 __atomic_* 未定义需手动处理"
+            fi
+          fi
+
+          SYSLIBS="$(echo "$SYSLIBS" | xargs)"
+          echo "DS_SYS_LIBS=[$SYSLIBS]"
+          echo "DS_SYS_LIBS=$SYSLIBS" >> "$GITHUB_ENV"
+
+      - name: Configure
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/.vcpkg-bincache"
+          case "${{ needs.check.outputs.libstdcxx }}" in
+            static) LINKFLAGS='-static-libstdc++ -static-libgcc' ;;
+            bundle) LINKFLAGS='' ;;
+            *) echo "::error::未知 libstdcxx 策略"; exit 1 ;;
+          esac
+          if [ "${DS_NO_STEAM:-OFF}" = "ON" ]; then
+            EXTRA="-DENABLE_STEAM_SUPPORT=OFF -DDS_NO_STEAM=ON"
+          else
+            EXTRA=""
+          fi
+          cmake -S "$PWD" -B "$GITHUB_WORKSPACE/builds/linux-${{ matrix.arch }}" \
+            -G "Ninja Multi-Config" \
+            -DCMAKE_C_COMPILER="$CC" \
+            -DCMAKE_CXX_COMPILER="$CXX" \
+            -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }} \
+            -DVCPKG_OVERLAY_TRIPLETS="$PWD/cmake/custom-triplets" \
+            -DCMAKE_SHARED_LINKER_FLAGS="$LINKFLAGS" \
+            -DCMAKE_MODULE_LINKER_FLAGS="$LINKFLAGS" \
+            -DCMAKE_EXE_LINKER_FLAGS="$LINKFLAGS" \
+            -DCMAKE_C_STANDARD_LIBRARIES="${DS_SYS_LIBS:-}" \
+            -DCMAKE_CXX_STANDARD_LIBRARIES="${DS_SYS_LIBS:-}" \
+            $EXTRA
+
+      - name: Build
+        run: cmake --build "$GITHUB_WORKSPACE/builds/linux-${{ matrix.arch }}" --config "${{ needs.check.outputs.build_type }}" --parallel 3
+
+      - name: Install（CMAKE_INSTALL_PREFIX = Mod/）
+        run: cmake --build "$GITHUB_WORKSPACE/builds/linux-${{ matrix.arch }}" --config "${{ needs.check.outputs.build_type }}" --target install
+
+      - name: bundle 模式：随包附带 libstdc++ / libgcc_s 到 Mod/deps
+        if: needs.check.outputs.libstdcxx == 'bundle'
+        run: |
+          set -euo pipefail
+          mkdir -p Mod/deps
+          cp -L "$("$CXX" -print-file-name=libstdc++.so.6)" Mod/deps/
+          cp -L "$("$CXX" -print-file-name=libgcc_s.so.1)" Mod/deps/
+          ls -l Mod/deps/libstdc++.so.6 Mod/deps/libgcc_s.so.1
+
+      # ------------------------------------------------------------------
+      # 让 Mod/deps 自包含：修正 RPATH + 补齐缺失依赖
+      #
+      # 典型故障（线上已出现过）：
+      #   dlopen failed: ... libInjector.so
+      #   (/lib/x86_64-linux-gnu/libcrypto.so.3: version `OPENSSL_3.3.0' not found
+      #    (required by .../deps/libssl.so.3))
+      #
+      # 根因是两层：
+      #   1) Mod/deps 里有 vcpkg 编出来的 libssl.so.3（OpenSSL 3.3），
+      #      但同版本的 libcrypto.so.3 没被收进来；
+      #   2) 即便收进来了，被 install 复制进 deps 的 .so 自身没有 $ORIGIN 的
+      #      RUNPATH —— 动态链接器解析"依赖的依赖"时只看 libssl.so.3 自己的
+      #      RUNPATH，不会沿用 libInjector.so 的 $ORIGIN/deps，
+      #      于是回退到系统路径，拿到系统那份 OpenSSL 3.0 的 libcrypto，
+      #      它当然没有 OPENSSL_3.3.0 的符号版本。
+      #
+      # 目标机差异很大更说明必须自包含：RHEL8/Debian10/Ubuntu20.04 是
+      # OpenSSL 1.1.1（连 libcrypto.so.3 都没有），Ubuntu 22.04 是 3.0，
+      # Debian 12 是 3.0 —— 只有把 libssl + libcrypto 成对打进 deps 才稳。
+      # ------------------------------------------------------------------
+      # ------------------------------------------------------------------
+      # 让 Mod/deps 真正自包含（这一版修的是根因，不是表面）
+      #
+      # 线上故障：
+      #   dlopen failed: .../libInjector.so
+      #   (/lib/x86_64-linux-gnu/libcrypto.so.3: version `OPENSSL_3.3.0' not found
+      #    (required by .../deps/libssl.so.3))
+      #
+      # deps 里明明有 libcrypto.so.3，为什么还去拿系统的？根因是搜索优先级：
+      #   动态链接器解析顺序 = DT_RPATH → LD_LIBRARY_PATH → DT_RUNPATH → cache → 默认路径
+      #   1) 饥荒服务器跑在 Steam Runtime 里，它设置了 LD_LIBRARY_PATH；
+      #   2) 我们上一版用的是 DT_RUNPATH（patchelf --set-rpath 默认产出的就是它），
+      #      优先级【低于】LD_LIBRARY_PATH → 被系统/Steam 的 OpenSSL 3.0 抢先命中；
+      #   3) DT_RUNPATH 还不传给"依赖的依赖"：即使 libInjector 有 $ORIGIN/deps，
+      #      libssl.so.3 自己没有 RUNPATH 时，找 libcrypto 仍会回退系统路径。
+      #
+      # 解法：改用 DT_RPATH（patchelf --force-rpath）
+      #   ✅ 优先级高于 LD_LIBRARY_PATH —— 能压过 Steam Runtime 的注入
+      #   ✅ 会沿依赖链传递继承 —— 父模块的 $ORIGIN/deps 对子依赖同样生效
+      #   （DT_RPATH 虽被标记为 deprecated，但恰恰是这里唯一能压过 LD_LIBRARY_PATH 的手段）
+      # ------------------------------------------------------------------
+      - name: 修正 RPATH 并让 Mod/deps 自包含
+        run: |
+          set -euo pipefail
+
+          # 1) 准备 patchelf
+          if ! command -v patchelf >/dev/null 2>&1; then
+            PYBIN="$(ls -d /opt/python/cp3*/bin/python3 2>/dev/null | sort -V | tail -n1)"
+            PYBIN="${PYBIN:-$(command -v python3)}"
+            "$PYBIN" -m pip install --quiet patchelf || true
+            ln -sf "$(dirname "$PYBIN")/patchelf" /usr/local/bin/patchelf 2>/dev/null || true
+          fi
+          command -v patchelf >/dev/null 2>&1 || { echo "::error::patchelf 不可用，无法保证 deps 自包含"; exit 1; }
+          patchelf --version
+
+          # 2) 收集所有需要检查的 ELF（主模块 + 插件 + deps）
+          mapfile -t elfs < <(find Mod -type f \( -name '*.so' -o -name '*.so.*' -o -name 'lua51*' -o -name 'luajit*' \) | sort)
+          echo "待处理 ELF: ${#elfs[@]}"
+
+          # 3) 补齐缺失依赖：deps 里每个 .so 的 DT_NEEDED 若不在 deps 中，就找来放进去
+          search_dirs=()
+          while IFS= read -r d; do search_dirs+=("$d"); done < <(
+            find "$GITHUB_WORKSPACE" -maxdepth 6 -type d \( -path '*/vcpkg_installed/*/lib' -o -path '*/vcpkg/packages/*/lib' -o -path '*/installed/*/lib' \) 2>/dev/null | sort -u
+          )
+          echo "依赖搜索目录: ${#search_dirs[@]}"
+
+          mkdir -p Mod/deps
+          added=0
+          for f in Mod/deps/*.so*; do
+            [ -f "$f" ] || continue
+            while IFS= read -r need; do
+              [ -n "$need" ] || continue
+              [ -e "Mod/deps/$need" ] && continue
+              case "$need" in
+                ld-linux*|libc.so*|libm.so*|libdl.so*|libpthread.so*|librt.so*|libresolv.so*|libutil.so*|libatomic.so*|libnsl.so*|libcrypt.so*) continue ;;
+              esac
+              found=""
+              for d in "${search_dirs[@]}"; do
+                if [ -f "$d/$need" ]; then found="$d/$need"; break; fi
+              done
+              if [ -n "$found" ]; then
+                cp -Lf "$found" "Mod/deps/$need"
+                echo "  补齐依赖: $need  (来源: ${found#$GITHUB_WORKSPACE/})"
+                added=$((added+1))
+              else
+                echo "::warning::未找到依赖 $need（将依赖目标机系统提供）"
+              fi
+            done < <(patchelf --print-needed "$f" 2>/dev/null || true)
+          done
+          echo "补齐依赖数量: $added"
+
+          # 4) 给【所有】产出的 ELF 设置 DT_RPATH。
+          #   统一给出多个候选前缀，适配不同层级布局（Mod/、plugins/<n>/、bin64/linux/lib64/）：
+          #     $ORIGIN            → deps 内的库互找
+          #     $ORIGIN/deps       → Mod 根下的模块
+          #     $ORIGIN/../../deps → Mod/plugins/<name>/plugin_*.so
+          #     $ORIGIN/../../../deps → Mod/bin64/linux/lib64/libInjector.so
+          RPATH_VAL='$ORIGIN:$ORIGIN/deps:$ORIGIN/../../deps:$ORIGIN/../../../deps'
+          echo "统一 DT_RPATH: $RPATH_VAL"
+          for f in "${elfs[@]}"; do
+            case "$(basename "$f")" in
+              libc.so*|libm.so*|ld-linux*) continue ;;
+            esac
+            patchelf --force-rpath --set-rpath "$RPATH_VAL" "$f" 2>/dev/null \
+              || echo "::warning::patchelf 失败: $f"
+          done
+          echo "已为全部 ELF 设置 DT_RPATH"
+
+          # 5) 自检（关键）：故意用 LD_LIBRARY_PATH 注入一个"敌方"目录做诱饵
+          #    —— 完整复现 Steam Runtime 抢库的环境。
+          #    只要 deps 里存在同名库，解析结果就必须落在 Mod/deps 内。
+          DECOY=/tmp/decoy_libs
+          rm -rf "$DECOY" && mkdir -p "$DECOY"
+          for f in Mod/deps/*.so*; do
+            [ -f "$f" ] || continue
+            cp -Lf "$f" "$DECOY/$(basename "$f")" 2>/dev/null || true
+          done
+          echo "诱饵目录中的库: $(ls -1 "$DECOY" 2>/dev/null | wc -l | tr -d ' ') 个"
+
+          # 必须用 realpath 规范化后再比较：
+          # $ORIGIN 展开出的 .../bin64/linux/lib64/../../../deps 字面量不含
+          # "/Mod/deps/"，直接字符串匹配会误报成"被劫持"。
+          DEPS_REAL="$(realpath Mod/deps)"
+          echo "deps 实际目录: $DEPS_REAL"
+          fail=0
+          for f in "${elfs[@]}"; do
+            while IFS= read -r line; do
+              name="$(printf '%s' "$line" | sed -n 's/^[[:space:]]*\([^ ]*\.so[^ ]*\) => \(.*\) (.*/\1/p')"
+              path="$(printf '%s' "$line" | sed -n 's/^[[:space:]]*\([^ ]*\.so[^ ]*\) => \(.*\) (.*/\2/p')"
+              [ -n "$name" ] || continue
+              [ -e "Mod/deps/$name" ] || continue
+              rp="$(realpath "$path" 2>/dev/null || printf '%s' "$path")"
+              case "$rp" in
+                "$DEPS_REAL"/*) ;;
+                *) echo "::error file=$f::$name 被劫持到 $rp（应命中 $DEPS_REAL/$name）"; fail=1 ;;
+              esac
+            done < <(LD_LIBRARY_PATH="$DECOY" ldd "$f" 2>/dev/null || true)
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::deps 未能压过 LD_LIBRARY_PATH，产物在 Steam Runtime 下仍会加载失败"
+            for f in Mod/deps/*.so*; do [ -f "$f" ] && echo "--- $f" && LD_LIBRARY_PATH="$DECOY" ldd "$f" 2>/dev/null | grep -E 'lib(ssl|crypto|curl)' || true; done
+            exit 1
+          fi
+          echo "✅ 自包含校验通过：即便存在 LD_LIBRARY_PATH 抢库，也始终命中 Mod/deps"
+          rm -rf "$DECOY"
+
+      - name: 校验：最高 glibc 符号版本不得超过 2.28
+        run: |
+          # 注意：不要在这里用 set -e + 无保护的 grep。
+          # 不带 GLIBC_ 符号的文件（无动态符号表 / stripped）会让 grep 返回 1，
+          # 配合 pipefail 使 `max=$(...)` 整体失败，set -e 会**静默**终止脚本
+          # （exit 1 且无任何输出）—— 这正是上一版"看不到日志"的原因。
+          set -uo pipefail
+          MAX_ALLOWED='GLIBC_2.28'
+          REPORT="$GITHUB_WORKSPACE/glibc-report.txt"
+          : > "$REPORT"
+          fail=0; scanned=0; skipped=0
+
+          mapfile -t files < <(find Mod -type f \( -name '*.so' -o -name '*.so.*' -o -name 'lua51*' -o -name 'luajit*' \) | sort)
+          echo "候选文件: ${#files[@]}"
+
+          for f in "${files[@]}"; do
+            # 不用 `file | grep -q`：grep -q 提前退出会让 file 收 SIGPIPE，
+            # pipefail 下被当成"非 ELF"而跳过。先取到变量再判断。
+            ft="$(file -b "$f" 2>/dev/null)" || ft=""
+            case "$ft" in
+              *ELF*) ;;
+              *) skipped=$((skipped+1)); echo "  跳过(非ELF): $f"; continue ;;
+            esac
+            scanned=$((scanned+1))
+
+            syms="$(objdump -T "$f" 2>/dev/null)" || syms=""
+            max="$(printf '%s\n' "$syms" | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' | sort -V | tail -1 || true)"
+            gxx="$(printf '%s\n' "$syms" | grep -oE 'GLIBCXX_[0-9]+(\.[0-9]+)+' | sort -V | tail -1 || true)"
+            [ -n "$max" ] || max="none"
+            [ -n "$gxx" ] || gxx="none"
+            printf '%-64s glibc=%-11s glibccxx=%s\n' "$f" "$max" "$gxx" | tee -a "$REPORT"
+
+            if [ "$max" != "none" ] && [ "$(printf '%s\n%s\n' "$max" "$MAX_ALLOWED" | sort -V | tail -1)" != "$MAX_ALLOWED" ]; then
+              echo "::error file=$f::需要 $max，超过 $MAX_ALLOWED"
+              fail=1
+            fi
+            if [ "$gxx" != "none" ]; then
+              echo "::warning file=$f::引入 $gxx（libstdc++ ABI）；请用 -static-libstdc++ 或随包附带 libstdc++.so.6"
+            fi
+          done
+
+          echo "已扫描 ELF: $scanned（跳过非 ELF: $skipped）"
+          {
+            echo '### glibc 符号版本校验'
+            echo "- 上限: $MAX_ALLOWED"
+            echo "- 已扫描 ELF: $scanned"
+            [ "$fail" -eq 0 ] && echo '- 结果: 通过' || echo '- 结果: 存在超标依赖'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$scanned" -eq 0 ]; then
+            echo "::error::未扫描到任何 ELF 文件，Mod/ 目录内容异常"
+            find Mod -maxdepth 2 | head -30 || true
+            exit 1
+          fi
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::存在超过 $MAX_ALLOWED 的符号依赖，详见 glibc-report.txt"
+            exit 1
+          fi
+          echo "ABI 校验通过：全部 ELF 最高 glibc 符号版本 <= $MAX_ALLOWED"
+      - name: 打包（剔除 Windows / macOS 目录）
+        env:
+          CHANNEL: ${{ matrix.channel }}
+        run: |
+          set -euo pipefail
+          rm -rf Mod/bin64/windows Mod/bin64/osx
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          # 固定文件名：DontStarveLuaJIT2-{stable|nightly}-linux-x86_64-glibc228.zip
+          ASSET="DontStarveLuaJIT2-${CHANNEL}-linux-x86_64-glibc228.zip"
+
+          # ----------------------------------------------------------------
+          # 先把 Mod/ 下的符号链接全部换成真实文件（要求：产物里不含任何链接）
+          #   逐个处理：解引用复制到临时位置 → 删掉链接 → 用真实文件顶上
+          #   指向目录的链接同样展开成真实目录
+          # ----------------------------------------------------------------
+          link_n=0
+          while IFS= read -r l; do
+            [ -L "$l" ] || continue
+            if [ -d "$l" ]; then
+              # 指向目录的链接 → 展开为真实目录
+              tmpd="$(mktemp -d)"
+              cp -RL "$l/." "$tmpd"/ 2>/dev/null || echo "::warning::目录链接解引用失败: $l"
+              rm -f "$l"
+              mkdir -p "$l"
+              cp -R "$tmpd"/. "$l"/ 2>/dev/null || true
+              rm -rf "$tmpd"
+            else
+              # 指向文件的链接（-p 保留目标文件的权限/时间戳）
+              tmpf="$(mktemp)"; rm -f "$tmpf"
+              if cp -pL "$l" "$tmpf" 2>/dev/null; then
+                rm -f "$l"; mv "$tmpf" "$l"
+              else
+                echo "::warning::文件链接解引用失败，已删除: $l"
+                rm -f "$tmpf" "$l"
+              fi
+            fi
+            link_n=$((link_n+1))
+          done < <(find Mod -type l | sort)
+          echo "已把符号链接转换为真实文件: $link_n 个"
+
+          # 兜底：仍有残留（如断裂链接）就直接删除，确保零链接
+          leftover="$(find Mod -type l | sort)"
+          if [ -n "$leftover" ]; then
+            echo "::warning::残留链接已删除:"; printf '%s\n' "$leftover"
+            find Mod -type l -delete
+          fi
+
+          # 打 zip（Mod/ 目录整体压进去，保持 Mod/xxx 结构）
+          # 注意：不再用 -y。-y 会把符号链接原样存进 zip；去掉它才是"存链接指向的内容"。
+          command -v zip >/dev/null || { echo "::error::缺少 zip"; exit 1; }
+          rm -f "$GITHUB_WORKSPACE/dist/$ASSET"
+          zip -q -r "$GITHUB_WORKSPACE/dist/$ASSET" Mod
+
+          # 自检：解开后必须一个符号链接都没有
+          rm -rf /tmp/zchk && mkdir -p /tmp/zchk
+          unzip -q "$GITHUB_WORKSPACE/dist/$ASSET" -d /tmp/zchk
+          n_left="$(find /tmp/zchk -type l | wc -l | tr -d ' ')"
+          echo "zip 内符号链接数量: $n_left"
+          test "$n_left" -eq 0 || { echo "::error::zip 内仍有 $n_left 个符号链接"; find /tmp/zchk -type l; exit 1; }
+          rm -rf /tmp/zchk
+
+          # 生成 .sha256 校验文件：与 zip 同名 + .sha256 后缀，内容为
+          # "<64位hex>  <文件名>"（GNU coreutils 标准格式，sha256sum -c 可直接校验）
+          SUM="${ASSET}.sha256"
+          cd "$GITHUB_WORKSPACE/dist"
+          sum="$(sha256sum "$ASSET" | awk '{print $1}')"
+          case "$sum" in
+            [0-9a-f]*) ;;
+            *) echo "::error::sha256sum 输出异常: $sum"; exit 1 ;;
+          esac
+          printf '%s  %s\n' "$sum" "$ASSET" > "$SUM"
+          cat "$SUM"
+
+          # upload-artifact@v4 会以"所有上传文件的最小公共目录"为归档根、保留相对路径。
+          # 直接传 dist/xxx.zip + 仓库根的 glibc-report.txt，公共根就是工作区，
+          # 归档里于是带上 __w/<repo>/<repo>/dist/ 这一长串 —— 这正是之前难看路径的来源。
+          # 做法：先把要上传的文件摊平到一个干净的目录，再整体上传该目录，
+          # 归档根就落在这个目录上，下载下来只有裸文件名。
+          OUT="$GITHUB_WORKSPACE/out"
+          rm -rf "$OUT" && mkdir -p "$OUT"
+          cp -f "$GITHUB_WORKSPACE/dist/$ASSET" "$OUT/$ASSET"
+          cp -f "$GITHUB_WORKSPACE/dist/$SUM"   "$OUT/$SUM"
+          cp -f "$GITHUB_WORKSPACE/glibc-report.txt" "$OUT/glibc-report.txt"
+          echo "待上传（归档根 = out/，下载后即为裸文件名）:"
+          ls -lh "$OUT"
+
+      # path 指向目录而不是具体文件：指向单个文件时 v4 同样会保留其完整路径。
+      - name: 上传二进制产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ds-${{ matrix.channel }}-linux-x86_64
+          path: ${{ github.workspace }}/out
+          if-no-files-found: error
+          # 只保留最新一个：仓库里始终只有 stable / nightly 各一份
+          retention-days: 7
+          overwrite: true
+
+  # --------------------------------------------------------------------
+  # publish：把两个通道的产物汇总成"一次提交 + 一次推送"。
+  # 不在 build job 里直接 push，是因为 matrix 两个通道并发执行会互相撞车。
+  # 写法参照 EcoEnchants_Binary：Configure Git User Details → Pre Push → Push。
+  # --------------------------------------------------------------------
+  publish:
+    name: 汇总产物并提交回仓库
+    needs: [check, build]
+    if: ${{ always() && needs.check.outputs.changed == 'true' && needs.build.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Git Repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Configure Git User Details
+        run: |
+          git config --global user.email "actions@github.com"
+          git config --global user.name "Github Actions"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ds-*-linux-x86_64
+          path: /tmp/art
+          merge-multiple: true
+
+      - name: Pre Push Binary Files
+        id: pre_push
+        env:
+          STABLE_SHA: ${{ needs.check.outputs.stable_sha }}
+          NIGHTLY_SHA: ${{ needs.check.outputs.nightly_sha }}
+          PURGE: ${{ inputs.purge_history }}
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+
+          ART_DIR=/tmp/art
+          KEEP_STABLE="DontStarveLuaJIT2-stable-linux-x86_64-glibc228.zip"
+          KEEP_NIGHTLY="DontStarveLuaJIT2-nightly-linux-x86_64-glibc228.zip"
+
+          echo "下载到的产物："
+          find "$ART_DIR" -type f \( -name '*.zip' -o -name '*.sha256' -o -name '*.tar.gz' -o -name 'glibc-report.txt' \) | sort
+
+          # 1) 删除根目录里所有历史产物（含旧命名的 .tar.gz、以及失效的 .sha256），
+          #    只保留 stable / nightly 的 zip 及其同名 .sha256
+          KEEP_SUM_S="${KEEP_STABLE}.sha256"
+          KEEP_SUM_N="${KEEP_NIGHTLY}.sha256"
+          find . -maxdepth 1 -type f \( -name '*.zip' -o -name '*.sha256' -o -name '*.tar.gz' -o -name '*.tgz' \) -print | while IFS= read -r f; do
+            b="$(basename "$f")"
+            case "$b" in
+              "$KEEP_STABLE"|"$KEEP_NIGHTLY"|"$KEEP_SUM_S"|"$KEEP_SUM_N") ;;
+              *) echo "  删除历史产物: $b"; git rm -f --quiet -- "$b" || rm -f -- "$b" ;;
+            esac
+          done
+
+          # 2) 放上本次构建的产物（哪个通道构建了就更新哪个；另一个沿用仓库里已有的）
+          #    同时记录哪些通道真的构建成功 —— 只有成功的通道才写 COMMIT_ID，
+          #    否则构建失败也会被记成"已追上"，下次就再也不会重试了。
+          copied=0
+          built_stable=false
+          built_nightly=false
+          for ch in stable nightly; do
+            ASSET="DontStarveLuaJIT2-${ch}-linux-x86_64-glibc228.zip"
+            # find 兜底：万一归档里仍带目录层级也能找到
+            src="$(find "$ART_DIR" -type f -name "$ASSET" | head -n1)"
+            if [ -n "$src" ] && [ -f "$src" ]; then
+              cp -f "$src" "./$ASSET"
+              echo "  更新 ${ch}: $(ls -lh "./$ASSET" | awk '{print $5}')  (来源: ${src#$ART_DIR/})"
+              # 同名的 .sha256 一起带上；缺失就现场补算，保证两者始终成对
+              SUM="${ASSET}.sha256"
+              fsum="$(find "$ART_DIR" -type f -name "$SUM" | head -n1)"
+              if [ -n "$fsum" ] && [ -f "$fsum" ]; then
+                cp -f "$fsum" "./$SUM"
+              else
+                echo "  ${ch} 缺 .sha256，现场补算"
+                ( cd "$(dirname "./$ASSET")" && sha256sum "$(basename "./$ASSET")" > "./$SUM" )
+              fi
+              echo "    校验值: $(awk '{print $1}' "./$SUM")"
+              copied=$((copied+1))
+              if [ "$ch" = "stable" ]; then built_stable=true; else built_nightly=true; fi
+            else
+              echo "  ${ch} 本次未构建，保留仓库现有文件"
+            fi
+          done
+          test "$copied" -ge 1 || { echo "::error::没有拿到任何产物"; find "$ART_DIR" | head -30 || true; exit 1; }
+
+          # 3) glibc 校验报告
+          rep="$(find "$ART_DIR" -type f -name 'glibc-report.txt' | head -n1)"
+          if [ -n "$rep" ]; then cp -f "$rep" ./glibc-report.txt; fi
+
+          # 4) 写回各通道对应的上游 commit —— 仅限本次真正构建成功的通道
+          if [ "$built_stable" = true ]  && [ -n "${STABLE_SHA:-}" ];  then printf '%s\n' "$STABLE_SHA"  > ./COMMIT_ID_stable;  fi
+          if [ "$built_nightly" = true ] && [ -n "${NIGHTLY_SHA:-}" ]; then printf '%s\n' "$NIGHTLY_SHA" > ./COMMIT_ID_nightly; fi
+
+          # 5) 逐个显式 add（文件不存在就跳过，避免 pathspec 不匹配导致整条 git add 失败）
+          staged=()
+          for f in "$KEEP_STABLE" "$KEEP_SUM_S" "$KEEP_NIGHTLY" "$KEEP_SUM_N" ./glibc-report.txt ./COMMIT_ID_stable ./COMMIT_ID_nightly; do
+            b="$(basename "$f")"
+            if [ -f "./$b" ]; then staged+=("./$b"); fi
+          done
+          echo "待提交: ${staged[*]:-<无>}"
+          git add -f -- "${staged[@]}"
+
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "仓库内容无变化，跳过提交"
+          else
+            short_n="$(printf '%s' "${NIGHTLY_SHA:-$STABLE_SHA}" | cut -c1-7)"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git commit -m "build: stable + nightly (linux x86_64 / glibc 2.28) @ ${short_n}"
+          fi
+          {
+            echo '### 本次发布'
+            echo "- stable  : $( [ "$built_stable" = true ] && echo "${STABLE_SHA}" || echo '<未构建>' )"
+            echo "- nightly : $( [ "$built_nightly" = true ] && echo "${NIGHTLY_SHA}" || echo '<未构建>' )"
+            echo "- 清理历史: ${PURGE:-false}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ⚠️ 可选：把历史提交里的旧产物彻底清除（改写历史 + 强制推送）
+      # 只在手动触发且 purge_history=true 时执行。
+      #
+      # 分三步，顺序很关键：git-filter-repo 的 --invert-paths 只能"反选路径"，
+      # 无法"保留某几个文件"，所以先把所有 tarball 从 HEAD 摘掉并重写历史，
+      # 再把当前两份产物重新加回来 —— 否则会把刚构建好的包一起抹掉。
+      - name: Purge Old Binaries From Git History
+        if: ${{ inputs.purge_history }}
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          echo "::warning::正在改写历史，随后会强制推送"
+          python3 -m pip install --quiet git-filter-repo
+
+          # 步骤1：把工作区里的归档 + 校验文件全部摘掉并提交
+          find . -maxdepth 1 -type f \( -name '*.zip' -o -name '*.sha256' -o -name '*.tar.gz' -o -name '*.tgz' \) -print | while IFS= read -r f; do
+            git rm -f --quiet -- "$(basename "$f")" || true
+          done
+          git commit -m "chore: drop binaries before history rewrite" || echo "无变化，跳过"
+
+          # 步骤2：从全部历史中抹去所有归档文件（含子目录）
+          git filter-repo --force --path-regex '.*\.(tar\.gz|tgz|zip)$' --invert-paths
+
+          # 步骤3：把本次构建的产物 + 同名 .sha256 重新加回来（只加实际存在的）
+          restored=()
+          for ch in stable nightly; do
+            ASSET="DontStarveLuaJIT2-${ch}-linux-x86_64-glibc228.zip"
+            src="/tmp/art/$ASSET"
+            [ -f "$src" ] || continue
+            cp -f "$src" "./$ASSET"
+            restored+=("./$ASSET")
+            SUM="${ASSET}.sha256"
+            if [ -f "/tmp/art/$SUM" ]; then
+              cp -f "/tmp/art/$SUM" "./$SUM"
+              restored+=("./$SUM")
+            fi
+          done
+          # 历史里已存在的旧命名产物不会再回来；仓库现有文件也要重新 add
+          for f in ./glibc-report.txt ./COMMIT_ID_stable ./COMMIT_ID_nightly; do
+            [ -f "$f" ] && restored+=("$f")
+          done
+          echo "恢复文件: ${restored[*]:-<无>}"
+          if [ "${#restored[@]}" -gt 0 ]; then
+            git add -f -- "${restored[@]}"
+            git commit -m "build: restore current binaries after history cleanup" || echo "无变化，跳过"
+          fi
+
+          # filter-repo 会移除 remote，重新挂上
+          git remote remove origin || true
+          git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}"
+
+      - name: Push Binary Files
+        if: steps.pre_push.outputs.changed == 'true' || inputs.purge_history
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          if [ "${{ inputs.purge_history }}" = "true" ]; then
+            # 历史已被改写，必须强制推送
+            git push --force origin "HEAD:${{ github.ref_name }}"
+            echo "已强制推送（历史已清理）"
+          else
+            git push "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}" \
+              "HEAD:${{ github.ref_name }}"
+            echo "已推送到 ${{ github.repository }}@${{ github.ref_name }}"
+          fi
+
+      # 若更想沿用 EcoEnchants_Binary 的第三方 action，可把上面 Push Binary Files 换成：
+      #
+      #      - name: Push Binary Files
+      #        if: steps.pre_push.outputs.changed == 'true'
+      #        uses: ad-m/github-push-action@master
+      #        with:
+      #          github_token: ${{ secrets.GITHUB_TOKEN }}
+      #          branch: ${{ github.ref_name }}
+
+  abi-smoke:
+    name: ABI smoke / ${{ matrix.name }}
+    needs: [check, build]
+    if: ${{ always() && needs.check.outputs.changed == 'true' && needs.build.result == 'success' }}
+    runs-on: ubuntu-24.04
+    container:
+      image: ${{ matrix.image }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # OpenSSL 1.1.1 —— 连 libcrypto.so.3 都不存在，最能暴露"回退到系统库"
+          - { name: 'AlmaLinux 8 (glibc 2.28 / OpenSSL 1.1.1)', image: 'almalinux:8',     pkg: 'yum' }
+          # OpenSSL 3.0 —— 正是线上报 OPENSSL_3.3.0 not found 的那类环境
+          - { name: 'Ubuntu 22.04 (glibc 2.35 / OpenSSL 3.0)',  image: 'ubuntu:22.04',    pkg: 'apt' }
+    steps:
+      - name: 安装解压工具
+        run: |
+          set -euo pipefail
+          if command -v yum >/dev/null 2>&1; then
+            yum install -y --setopt=tsflags=nodocs unzip zip tar >/dev/null 2>&1 || true
+          else
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq >/dev/null 2>&1 || true
+            apt-get install -y -qq unzip zip tar >/dev/null 2>&1 || true
+          fi
+          command -v unzip >/dev/null 2>&1 || { echo "::error::unzip 不可用"; exit 1; }
+
+      - name: 显示运行时环境
+        run: |
+          set -euo pipefail
+          libc_ver="$(ldd --version)"; echo "glibc: ${libc_ver%%$'\n'*}"
+          echo "系统 OpenSSL 库:"
+          ls -l /usr/lib/x86_64-linux-gnu/libcrypto.so* /usr/lib64/libcrypto.so* /lib64/libcrypto.so* 2>/dev/null || echo "  （该系统没有 libcrypto.so.3，必须完全依赖自带 deps）"
+
+      - name: 下载产物
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ds-*-linux-x86_64
+          path: /tmp/art
+          merge-multiple: true
+
+      # 关键：主动注入一个"敌方" LD_LIBRARY_PATH 做诱饵。
+      # 上一版这里是不设 LD_LIBRARY_PATH，反而掩盖了真凶 ——
+      # 饥荒服务器跑在 Steam Runtime 里，它会设置 LD_LIBRARY_PATH，
+      # 而 LD_LIBRARY_PATH 优先级高于 DT_RUNPATH（上一版用的正是 RUNPATH），
+      # 于是 CI 全绿、线上却 dlopen 失败。这里复现抢库环境，逼 DT_RPATH 顶住。
+      - name: ldd -r 全量符号/库解析检查（注入敌方 LD_LIBRARY_PATH）
+        run: |
+          set -euo pipefail
+          ART_DIR=/tmp/art
+          mapfile -t tarballs < <(find "$ART_DIR" -type f \( -name '*.zip' -o -name '*.tar.gz' \) | sort)
+          echo "待检查: ${#tarballs[@]} 个"
+          test "${#tarballs[@]}" -ge 1 || { echo "::error::没有找到任何产物"; find "$ART_DIR" | head -20 || true; exit 1; }
+          for t in "${tarballs[@]}"; do
+            echo "### 检查 $(basename "$t")"
+            rm -rf /tmp/chk && mkdir -p /tmp/chk
+            case "$t" in
+              *.zip) unzip -q "$t" -d /tmp/chk ;;
+              *)     tar xzf "$t" -C /tmp/chk ;;
+            esac
+            # 诱饵目录：把 deps 里的库复制一份放到别处，用 LD_LIBRARY_PATH 指过去。
+            # 若产物仍命中 /tmp/chk/Mod/deps/... 说明 DT_RPATH 顶住了抢库。
+            DECOY=/tmp/decoy_smoke
+            rm -rf "$DECOY" && mkdir -p "$DECOY"
+            cp -Lf /tmp/chk/Mod/deps/*.so* "$DECOY"/ 2>/dev/null || true
+            export LD_LIBRARY_PATH="$DECOY"
+
+            missing=0
+            while IFS= read -r so; do
+              ft="$(file -b "$so" 2>/dev/null)" || ft=""
+              case "$ft" in *ELF*) ;; *) continue ;; esac
+              out="$(ldd -r "$so" 2>&1)" || missing=1
+              if printf '%s\n' "$out" | grep -qE 'not found|undefined symbol|version .* not found'; then
+                echo "::error file=$(basename "$t")::$(basename "$so") $(printf '%s\n' "$out" | grep -E 'not found|undefined symbol' | head -3)"
+                missing=1
+              fi
+            done < <(find /tmp/chk/Mod -type f \( -name '*.so' -o -name '*.so.*' \) | sort)
+            if [ "$missing" -ne 0 ]; then
+              echo "::error::$(basename "$t") 在 ${{ matrix.name }} 上无法完整解析"
+              exit 1
+            fi
+          done
+          echo "ABI smoke OK @ ${{ matrix.name }}"
+
+      # 单独把 OpenSSL 那条最容易出事的链路打出来，失败时一眼能看到
+      - name: 重点核查自带 OpenSSL 是否被真正使用
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/chk && mkdir -p /tmp/chk
+          t="$(find /tmp/art -type f -name '*.zip' | head -n1)"
+          [ -n "$t" ] || exit 0
+          unzip -q "$t" -d /tmp/chk
+          echo "deps 中的 ssl/crypto:"
+          ls -l /tmp/chk/Mod/deps/ 2>/dev/null | grep -E 'lib(ssl|crypto)' || echo "  （deps 中没有 libssl/libcrypto，说明 vcpkg 依赖没收集进来）"
+          for so in /tmp/chk/Mod/deps/libssl.so* /tmp/chk/Mod/deps/libcrypto.so*; do
+            [ -f "$so" ] || continue
+            echo "--- $(basename "$so") 解析结果:"
+            ldd "$so" 2>&1 | grep -E 'libcrypto|libssl|not found' || true
+          done
+          # 若存在自带的 libcrypto，则 libssl 必须解析到它，不能落到系统路径
+          DECOY=/tmp/decoy_smoke
+          rm -rf "$DECOY" && mkdir -p "$DECOY"
+          cp -Lf /tmp/chk/Mod/deps/*.so* "$DECOY"/ 2>/dev/null || true
+          if ls /tmp/chk/Mod/deps/libcrypto.so* >/dev/null 2>&1; then
+            # 同样用 realpath 规范化，避免 $ORIGIN 展开出的 ../../ 造成误判
+            DEPS_REAL="$(realpath /tmp/chk/Mod/deps)"
+            bad=""
+            while IFS= read -r line; do
+              p2="$(printf '%s' "$line" | sed -n 's/^[[:space:]]*\([^ ]*\.so[^ ]*\) => \(.*\) (.*/\2/p')"
+              [ -n "$p2" ] || continue
+              rp="$(realpath "$p2" 2>/dev/null || printf '%s' "$p2")"
+              case "$rp" in "$DEPS_REAL"/*) ;; *) bad="$bad $rp" ;; esac
+            done < <(LD_LIBRARY_PATH="$DECOY" ldd /tmp/chk/Mod/deps/libssl.so* 2>/dev/null | grep 'libcrypto' || true)
+            if [ -n "$bad" ]; then
+              echo "::error::libssl 仍回退到系统 libcrypto: $bad"
+              exit 1
+            fi
+            echo "✅ 自带 libssl 正确绑定到自带 libcrypto"
+          fi
