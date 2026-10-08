@@ -254,7 +254,7 @@ jobs:
     name: ${{ matrix.channel }} / linux-x86_64 / glibc 2.28
     needs: check
     if: ${{ needs.check.outputs.changed == 'true' }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     container:
       image: quay.io/pypa/manylinux_2_28_x86_64
     timeout-minutes: 360
@@ -775,6 +775,84 @@ jobs:
       #   ✅ 会沿依赖链传递继承 —— 父模块的 $ORIGIN/deps 对子依赖同样生效
       #   （DT_RPATH 虽被标记为 deprecated，但恰恰是这里唯一能压过 LD_LIBRARY_PATH 的手段）
       # ------------------------------------------------------------------
+      # ------------------------------------------------------------------
+      # 【真正的根因修复】给 deps 里"游戏也会加载"的库换 SONAME 身份
+      #
+      # 为什么 RPATH 不够（上一版失败的原因）：
+      #   glibc 的 _dl_map_object 解析 DT_NEEDED 时，【先】在"已加载模块链表"
+      #   里按 SONAME 找；命中就直接复用，压根不走 RPATH/LD_LIBRARY_PATH 搜索。
+      #   饥荒/ Steam Runtime 启动时先加载了系统的 libcrypto.so.3，
+      #   于是我们的 deps/libssl.so.3 请求 "libcrypto.so.3" 时被直接复用成系统那份
+      #   → version `OPENSSL_3.3.0' not found。
+      #   实测：即使 DT_RPATH=$ORIGIN 指向 deps，依然 100% 绑到系统库。
+      #
+      # 解法：换 SONAME，让我们这份在 ld.so 眼里成为【另一个库】。
+      #   这不是野路子——本仓库自己就这么干：LuaJIT 产物叫 lua51DS / liblua51DS.so，
+      #   注释写明 "to coexist cleanly with native game libraries"。
+      #   同理这里改成 libcryptoDS.so.3 / libsslDS.so.3 等。
+      #
+      # 效果（沙盒实测）：
+      #   修复前 → libInjector 链路最终使用 SYSTEM ❌
+      #   修复后 → libInjector 链路最终使用 OURS   ✅
+      #   且游戏自己的 libcrypto.so.3 完全不受影响（我们没碰系统库）。
+      # ------------------------------------------------------------------
+      - name: 隔离 deps 与游戏同名库（改写 SONAME）
+        run: |
+          set -euo pipefail
+          command -v patchelf >/dev/null 2>&1 || { echo "::error::patchelf 不可用"; exit 1; }
+          mkdir -p Mod/deps
+
+          # 游戏进程极可能已加载、且我们 deps 也自带的库 → 需要换身份
+          # （openssl 是元凶；curl/zlib 同理，游戏基本都会先占坑）
+          CONFLICT_LIBS=(libcrypto.so.3 libssl.so.3 libcrypto.so libssl.so
+                         libcurl.so.4 libcurl.so libz.so.1 libz.so)
+
+          declare -A MAP
+          for old in "${CONFLICT_LIBS[@]}"; do
+            f="Mod/deps/$old"
+            [ -f "$f" ] || continue
+            case "$old" in
+              *.so.*) base="${old%%.so*}"; suf=".so${old#*.so}" ;;
+              *.so)   base="${old%.so}";   suf=".so" ;;
+              *) continue ;;
+            esac
+            new="${base}DS${suf}"
+            [ "$old" = "$new" ] && continue
+            mv -f "$f" "Mod/deps/$new"
+            # 关键：SONAME 必须一起改，否则 ld.so 仍按旧名字识别
+            patchelf --set-soname "$new" "Mod/deps/$new" \
+              || echo "::warning::set-soname 失败: $new"
+            MAP["$old"]="$new"
+            echo "  换个身份: $old -> $new"
+          done
+
+          if [ "${#MAP[@]}" -eq 0 ]; then
+            echo "deps 中没有需要隔离的同名库，跳过"
+          else
+            # 把所有自有 ELF 的 DT_NEEDED 指向新名字
+            while IFS= read -r f; do
+              for old in "${!MAP[@]}"; do
+                if patchelf --print-needed "$f" 2>/dev/null | grep -qx "$old"; then
+                  patchelf --replace-needed "$old" "${MAP[$old]}" "$f" \
+                    || echo "::warning::replace-needed 失败: $f ($old)"
+                  echo "  $(basename "$f"): $old -> ${MAP[$old]}"
+                fi
+              done
+            done < <(find Mod -type f \( -name '*.so' -o -name '*.so.*' -o -name 'lua51*' -o -name 'luajit*' \) | sort)
+          fi
+
+          # 自检：任何自有 ELF 都不应再依赖"未改名的"同名库
+          left=0
+          while IFS= read -r f; do
+            bad="$(patchelf --print-needed "$f" 2>/dev/null | grep -E '^lib(crypto|ssl|curl|z)\.so' || true)"
+            if [ -n "$bad" ]; then
+              echo "::error file=$f::仍依赖系统同名库: $bad"
+              left=1
+            fi
+          done < <(find Mod -type f \( -name '*.so' -o -name '*.so.*' -o -name 'lua51*' -o -name 'luajit*' \) | sort)
+          test "$left" -eq 0 || { echo "::error::SONAME 隔离未完成"; exit 1; }
+          echo "✅ SONAME 隔离完成：deps 内的同名库已独立，不再被游戏抢占"
+
       - name: 修正 RPATH 并让 Mod/deps 自包含
         run: |
           set -euo pipefail
@@ -1237,7 +1315,7 @@ jobs:
     name: ABI smoke / ${{ matrix.name }}
     needs: [check, build]
     if: ${{ always() && needs.check.outputs.changed == 'true' && needs.build.result == 'success' }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     container:
       image: ${{ matrix.image }}
     timeout-minutes: 30
