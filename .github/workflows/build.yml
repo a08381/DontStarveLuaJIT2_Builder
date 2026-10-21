@@ -359,7 +359,8 @@ jobs:
           PYBIN="$(ls -d /opt/python/cp3*/bin/python3 2>/dev/null | sort -V | tail -n1)"
           PYBIN="${PYBIN:-$(command -v python3)}"
           "$PYBIN" -m pip install --upgrade pip
-          "$PYBIN" -m pip install 'cmake==3.31.6' 'ninja==1.11.1' 'meson'
+          # vcpkg's SPDX scripts use string(JSON ... STRING_ENCODE), introduced in CMake 4.3.
+          "$PYBIN" -m pip install 'cmake==4.3.0' 'ninja==1.11.1' 'meson'
           ln -sf "$(dirname "$PYBIN")/cmake" /usr/local/bin/cmake
           ln -sf "$(dirname "$PYBIN")/ninja" /usr/local/bin/ninja
           ln -sf "$(dirname "$PYBIN")/meson" /usr/local/bin/meson
