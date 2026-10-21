@@ -821,8 +821,10 @@ jobs:
             [ "$old" = "$new" ] && continue
             mv -f "$f" "Mod/deps/$new"
             # 关键：SONAME 必须一起改，否则 ld.so 仍按旧名字识别
-            patchelf --set-soname "$new" "Mod/deps/$new" \
-              || echo "::warning::set-soname 失败: $new"
+            if ! patchelf --set-soname "$new" "Mod/deps/$new"; then
+              echo "::error file=Mod/deps/$new::set-soname 失败: $new"
+              exit 1
+            fi
             MAP["$old"]="$new"
             echo "  换个身份: $old -> $new"
           done
@@ -833,9 +835,17 @@ jobs:
             # 把所有自有 ELF 的 DT_NEEDED 指向新名字
             while IFS= read -r f; do
               for old in "${!MAP[@]}"; do
-                if patchelf --print-needed "$f" 2>/dev/null | grep -qx "$old"; then
-                  patchelf --replace-needed "$old" "${MAP[$old]}" "$f" \
-                    || echo "::warning::replace-needed 失败: $f ($old)"
+                needed="$(patchelf --print-needed "$f" 2>/dev/null || true)"
+                if grep -Fxq "$old" <<< "$needed"; then
+                  if ! patchelf --replace-needed "$old" "${MAP[$old]}" "$f"; then
+                    echo "::error file=$f::replace-needed 失败: $old -> ${MAP[$old]}"
+                    exit 1
+                  fi
+                  needed="$(patchelf --print-needed "$f" 2>/dev/null || true)"
+                  if grep -Fxq "$old" <<< "$needed"; then
+                    echo "::error file=$f::DT_NEEDED 改写后仍包含 $old (目标: ${MAP[$old]})"
+                    exit 1
+                  fi
                   echo "  $(basename "$f"): $old -> ${MAP[$old]}"
                 fi
               done
