@@ -1,0 +1,82 @@
+name: cleanup-glibc228-build-runs
+
+on:
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+jobs:
+  cleanup:
+    name: 清理过期失败及无产物构建
+    runs-on: ubuntu-latest
+    steps:
+      - name: 清理 glibc 2.28 workflow 的过期 runs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          cutoff_epoch="$(date -u -d '7 days ago' +%s)"
+          page=1
+          deleted=0
+          kept=0
+          reached_cutoff=false
+
+          while [ "$reached_cutoff" != true ]; do
+            runs="$(gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/build.yml/runs?status=completed&per_page=100&page=${page}")"
+            page_count="$(jq '.workflow_runs | length' <<< "$runs")"
+            [ "$page_count" -gt 0 ] || break
+
+            while IFS=$'\t' read -r run_id created_at conclusion; do
+              created_epoch="$(date -u -d "$created_at" +%s)"
+              if [ "$created_epoch" -ge "$cutoff_epoch" ]; then
+                continue
+              fi
+              reached_cutoff=true
+
+              case "$conclusion" in
+                failure|timed_out|action_required|startup_failure|stale)
+                  remove=true
+                  reason="conclusion=${conclusion}"
+                  ;;
+                success|skipped)
+                  jobs="$(gh api \
+                    "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/jobs?per_page=100")"
+                  successful_builds="$(jq '[.jobs[] | select(
+                    .conclusion == "success" and
+                    (.name | test("^(stable|nightly) / linux-x86_64 / glibc 2\\.28$"))
+                  )] | length' <<< "$jobs")"
+                  if [ "$successful_builds" -eq 0 ]; then
+                    remove=true
+                    reason="no successful build jobs"
+                  else
+                    remove=false
+                    reason="successful build jobs found"
+                  fi
+                  ;;
+                *)
+                  remove=false
+                  reason="preserving conclusion=${conclusion}"
+                  ;;
+              esac
+
+              if [ "$remove" = true ]; then
+                gh api --method DELETE \
+                  "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}"
+                echo "Deleted run ${run_id}: ${reason} (created ${created_at})"
+                deleted=$((deleted + 1))
+              else
+                echo "Kept run ${run_id}: ${reason} (created ${created_at})"
+                kept=$((kept + 1))
+              fi
+            done < <(jq -r '.workflow_runs[] | [.id, .created_at, (.conclusion // "")] | @tsv' <<< "$runs")
+
+            [ "$page_count" -eq 100 ] || break
+            page=$((page + 1))
+          done
+
+          echo "Cleanup complete: deleted=${deleted}, kept=${kept}"
