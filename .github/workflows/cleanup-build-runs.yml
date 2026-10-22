@@ -10,73 +10,108 @@ permissions:
 
 jobs:
   cleanup:
-    name: 清理过期失败及无产物构建
+    name: 清理失败及无产物构建
     runs-on: ubuntu-latest
     steps:
-      - name: 清理 glibc 2.28 workflow 的过期 runs
+      - name: 清理自身和 glibc 2.28 构建 workflow 的 runs
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
 
-          cutoff_epoch="$(date -u -d '7 days ago' +%s)"
-          page=1
+          artifact_runs="$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.expired == false and .workflow_run.id != null) | .workflow_run.id')"
+          declare -A has_artifact=()
+          while IFS= read -r run_id; do
+            [ -n "$run_id" ] && has_artifact["$run_id"]=1
+          done <<< "$artifact_runs"
+
           deleted=0
           kept=0
-          reached_cutoff=false
 
-          while [ "$reached_cutoff" != true ]; do
-            runs="$(gh api \
-              "repos/${GITHUB_REPOSITORY}/actions/workflows/build.yml/runs?status=completed&per_page=100&page=${page}")"
-            page_count="$(jq '.workflow_runs | length' <<< "$runs")"
-            [ "$page_count" -gt 0 ] || break
+          is_newer() {
+            local candidate_time="$1"
+            local candidate_id="$2"
+            local reference_time="$3"
+            local reference_id="$4"
+
+            if [[ "$candidate_time" > "$reference_time" ]]; then
+              return 0
+            fi
+            if [[ "$candidate_time" == "$reference_time" ]] && [ "$candidate_id" -gt "$reference_id" ]; then
+              return 0
+            fi
+            return 1
+          }
+
+          has_artifact_run() {
+            [[ -v "has_artifact[$1]" ]]
+          }
+
+          for workflow in cleanup-build-runs.yml build.yml; do
+            echo "Processing workflow ${workflow}"
+            runs="$(gh api --paginate \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow}/runs?status=completed&per_page=100&sort=created&direction=desc" \
+              --jq '.workflow_runs[] | [.id, .created_at, (.conclusion // "")] | @tsv')"
+
+            latest_failure_id=""
+            latest_failure_created=""
+            latest_artifact_success_id=""
+            latest_artifact_success_created=""
 
             while IFS=$'\t' read -r run_id created_at conclusion; do
-              created_epoch="$(date -u -d "$created_at" +%s)"
-              if [ "$created_epoch" -ge "$cutoff_epoch" ]; then
-                continue
-              fi
-              reached_cutoff=true
-
+              [ -n "$run_id" ] || continue
               case "$conclusion" in
                 failure|timed_out|action_required|startup_failure|stale)
-                  remove=true
-                  reason="conclusion=${conclusion}"
-                  ;;
-                success|skipped)
-                  jobs="$(gh api \
-                    "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/jobs?per_page=100")"
-                  successful_builds="$(jq '[.jobs[] | select(
-                    .conclusion == "success" and
-                    (.name | test("^(stable|nightly) / linux-x86_64 / glibc 2\\.28$"))
-                  )] | length' <<< "$jobs")"
-                  if [ "$successful_builds" -eq 0 ]; then
-                    remove=true
-                    reason="no successful build jobs"
-                  else
-                    remove=false
-                    reason="successful build jobs found"
+                  if [ -z "$latest_failure_id" ] || is_newer \
+                    "$created_at" "$run_id" "$latest_failure_created" "$latest_failure_id"; then
+                    latest_failure_id="$run_id"
+                    latest_failure_created="$created_at"
                   fi
                   ;;
-                *)
-                  remove=false
-                  reason="preserving conclusion=${conclusion}"
+                success)
+                  if has_artifact_run "$run_id" && {
+                    [ -z "$latest_artifact_success_id" ] || is_newer \
+                      "$created_at" "$run_id" "$latest_artifact_success_created" "$latest_artifact_success_id"
+                  }; then
+                    latest_artifact_success_id="$run_id"
+                    latest_artifact_success_created="$created_at"
+                  fi
                   ;;
               esac
+            done <<< "$runs"
 
-              if [ "$remove" = true ]; then
+            keep_latest_failure=false
+            if [ -n "$latest_failure_id" ]; then
+              if [ -z "$latest_artifact_success_id" ] || ! is_newer \
+                "$latest_artifact_success_created" "$latest_artifact_success_id" \
+                "$latest_failure_created" "$latest_failure_id"; then
+                keep_latest_failure=true
+              fi
+            fi
+
+            while IFS=$'\t' read -r run_id created_at conclusion; do
+              [ -n "$run_id" ] || continue
+
+              if [ "$conclusion" = success ] && has_artifact_run "$run_id"; then
+                echo "Kept run ${run_id}: successful run with artifact (created ${created_at})"
+                kept=$((kept + 1))
+              elif [ "$run_id" = "$latest_failure_id" ] && [ "$keep_latest_failure" = true ]; then
+                echo "Kept run ${run_id}: latest failed run without a later successful artifact run (created ${created_at})"
+                kept=$((kept + 1))
+              else
+                if has_artifact_run "$run_id"; then
+                  artifact_state=yes
+                else
+                  artifact_state=no
+                fi
                 gh api --method DELETE \
                   "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}"
-                echo "Deleted run ${run_id}: ${reason} (created ${created_at})"
+                echo "Deleted run ${run_id}: conclusion=${conclusion}, artifact=${artifact_state} (created ${created_at})"
                 deleted=$((deleted + 1))
-              else
-                echo "Kept run ${run_id}: ${reason} (created ${created_at})"
-                kept=$((kept + 1))
               fi
-            done < <(jq -r '.workflow_runs[] | [.id, .created_at, (.conclusion // "")] | @tsv' <<< "$runs")
-
-            [ "$page_count" -eq 100 ] || break
-            page=$((page + 1))
+            done <<< "$runs"
           done
 
           echo "Cleanup complete: deleted=${deleted}, kept=${kept}"
