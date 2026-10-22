@@ -725,6 +725,32 @@ jobs:
       - name: Install（CMAKE_INSTALL_PREFIX = Mod/）
         run: cmake --build "$GITHUB_WORKSPACE/builds/linux-${{ matrix.arch }}" --config "${{ needs.check.outputs.build_type }}" --target install
 
+      - name: 用当前工具链重建 Linux Lua 5.1 预置文件
+        run: |
+          set -euo pipefail
+          BUILD_DIR="$GITHUB_WORKSPACE/builds/linux-${{ matrix.arch }}"
+          LUA_BIN="$(find "$BUILD_DIR" -type f -path '*/src/lua51original/lua' -print -quit)"
+
+          if [ -z "$LUA_BIN" ]; then
+            echo "::error::未找到当前配置构建的 Lua 5.1 解释器"
+            find "$BUILD_DIR" -path '*/src/lua51original/*' -type f | head -30 || true
+            exit 1
+          fi
+          if [ ! -f Mod/deps/liblua51Original.so ]; then
+            echo "::error::未找到由当前工具链构建的 liblua51Original.so"
+            exit 1
+          fi
+          command -v patchelf >/dev/null 2>&1 || { echo "::error::patchelf 不可用"; exit 1; }
+
+          # 上游预置文件使用 GLIBC_2.29；用同一套 Lua 5.1 源码在 glibc 2.28 容器中重建。
+          cp -f Mod/deps/liblua51Original.so Mod/deps/liblua51.so
+          patchelf --set-soname liblua51.so Mod/deps/liblua51.so
+          cp -f Mod/deps/liblua51.so Mod/bin64/linux/lib64/liblua51.so
+          cp -f "$LUA_BIN" Mod/bin64/linux/lib64/lua51
+          chmod +x Mod/bin64/linux/lib64/lua51
+          echo "已替换上游预置 Lua 5.1 库和解释器："
+          ls -l Mod/deps/liblua51.so Mod/bin64/linux/lib64/liblua51.so Mod/bin64/linux/lib64/lua51
+
       - name: bundle 模式：随包附带 libstdc++ / libgcc_s 到 Mod/deps
         if: needs.check.outputs.libstdcxx == 'bundle'
         run: |
