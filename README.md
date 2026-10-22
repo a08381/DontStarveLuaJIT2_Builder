@@ -22,7 +22,7 @@
 3. 将解析到的提交与 `COMMIT_ID_stable`、`COMMIT_ID_nightly` 比较，只构建有变化的通道。
 4. 在 `manylinux_2_28_x86_64` 容器中使用 CMake、Ninja 和探测到的 GCC 工具链构建上游项目。
 5. 整理依赖并为 ELF 设置运行时搜索路径；隔离可能与游戏进程冲突的依赖 SONAME。
-6. 用当前 glibc 2.28 构建环境的 Lua 5.1 产物替换上游预置的 Linux Lua 文件。
+6. 保留上游预置的 Lua 5.1 签名参考库，只将 `libm.so.6` 的 `GLIBC_2.29` 数学符号版本需求映射到 glibc 2.28 已提供的 `GLIBC_2.2.5` ABI，不替换 Lua 函数机器码。
 7. 检查 ELF 的 GLIBC 符号版本不高于 `GLIBC_2.28`，生成 `glibc-report.txt`。
 8. 打包并生成 SHA-256 校验文件；通过 ABI smoke 检查后，由单独的发布任务把成功构建的通道产物和提交记录更新到仓库。
 
